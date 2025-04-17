@@ -155,8 +155,8 @@ pass_kzaw::compare_functions(const std::vector<gimple *> &func1_stmts,
   for (size_t i = 0; i < func1_stmts.size(); i++) {
     gimple *stmt1 = func1_stmts[i];
     gimple *stmt2 = func2_stmts[i];
-    
-    // Check if statement codes are different
+
+    // Add safety check for null statements
     if (!stmt1 || !stmt2) {
       if (dump_file) {
         fprintf(dump_file, "Statement %zu: One or both statements are null\n", i);
@@ -169,7 +169,7 @@ pass_kzaw::compare_functions(const std::vector<gimple *> &func1_stmts,
       if (dump_file) {
         fprintf(dump_file, "Statement %zu: Different gimple codes (%d vs %d)\n", 
                 i, gimple_code(stmt1), gimple_code(stmt2));
-                
+
         // Use safer printing method without TDF_SLIM flag, which might be causing issues on AArch64
         fprintf(dump_file, "Statement 1 code: %d\n", gimple_code(stmt1));
         fprintf(dump_file, "Statement 2 code: %d\n", gimple_code(stmt2));
@@ -181,13 +181,15 @@ pass_kzaw::compare_functions(const std::vector<gimple *> &func1_stmts,
     switch (gimple_code(stmt1)) {
     case GIMPLE_ASSIGN:
       {
+        // Check operation code
         if (gimple_assign_rhs_code(stmt1) != gimple_assign_rhs_code(stmt2)) {
           if (dump_file) {
             fprintf(dump_file, "Assignment operation mismatch at statement %zu\n", i);
           }
           return false;
         }
-
+        
+        // Check operand count
         unsigned op_count1 = gimple_num_ops(stmt1);
         unsigned op_count2 = gimple_num_ops(stmt2);
         if (op_count1 != op_count2) {
@@ -196,18 +198,20 @@ pass_kzaw::compare_functions(const std::vector<gimple *> &func1_stmts,
           }
           return false;
         }
-
+        
+        // For constants and literals, values must match exactly
         for (unsigned j = 1; j < op_count1; j++) {
           tree op1 = gimple_op(stmt1, j);
           tree op2 = gimple_op(stmt2, j);
-
+          
           if (TREE_CODE(op1) != TREE_CODE(op2)) {
             if (dump_file) {
               fprintf(dump_file, "Different operand types at statement %zu\n", i);
             }
             return false;
           }
-
+          
+          // For constants, compare values
           if (CONSTANT_CLASS_P(op1) && CONSTANT_CLASS_P(op2)) {
             if (!vrp_operand_equal_p(op1, op2)) {
               if (dump_file) {
@@ -219,23 +223,25 @@ pass_kzaw::compare_functions(const std::vector<gimple *> &func1_stmts,
         }
       }
       break;
-
+      
     case GIMPLE_CALL:
       {
+        // Check if calling the same function
         tree func1 = gimple_call_fn(as_a<gcall *>(stmt1));
         tree func2 = gimple_call_fn(as_a<gcall *>(stmt2));
-
+        
         if (TREE_CODE(func1) != TREE_CODE(func2)) {
           if (dump_file) {
             fprintf(dump_file, "Different function call types at statement %zu\n", i);
           }
           return false;
         }
-
+        
+        // If it's a direct function call, compare the function declarations
         if (TREE_CODE(func1) == ADDR_EXPR) {
           tree fn_decl1 = TREE_OPERAND(func1, 0);
           tree fn_decl2 = TREE_OPERAND(func2, 0);
-
+          
           if (DECL_NAME(fn_decl1) != DECL_NAME(fn_decl2)) {
             if (dump_file) {
               fprintf(dump_file, "Calling different functions at statement %zu\n", i);
@@ -243,7 +249,8 @@ pass_kzaw::compare_functions(const std::vector<gimple *> &func1_stmts,
             return false;
           }
         }
-
+        
+        // Check argument count
         unsigned arg_count1 = gimple_call_num_args(as_a<gcall *>(stmt1));
         unsigned arg_count2 = gimple_call_num_args(as_a<gcall *>(stmt2));
         if (arg_count1 != arg_count2) {
@@ -254,9 +261,10 @@ pass_kzaw::compare_functions(const std::vector<gimple *> &func1_stmts,
         }
       }
       break;
-
+      
     case GIMPLE_COND:
       {
+        // Check condition code
         enum tree_code code1 = gimple_cond_code(as_a<gcond *>(stmt1));
         enum tree_code code2 = gimple_cond_code(as_a<gcond *>(stmt2));
         if (code1 != code2) {
@@ -267,12 +275,13 @@ pass_kzaw::compare_functions(const std::vector<gimple *> &func1_stmts,
         }
       }
       break;
-
+      
     case GIMPLE_RETURN:
       {
+        // Check if one returns a value and the other doesn't
         tree ret_val1 = gimple_return_retval(as_a<greturn *>(stmt1));
         tree ret_val2 = gimple_return_retval(as_a<greturn *>(stmt2));
-
+        
         if ((ret_val1 == NULL_TREE) != (ret_val2 == NULL_TREE)) {
           if (dump_file) {
             fprintf(dump_file, "One function returns a value, the other doesn't at statement %zu\n", i);
@@ -281,20 +290,19 @@ pass_kzaw::compare_functions(const std::vector<gimple *> &func1_stmts,
         }
       }
       break;
-
+      
     default:
-      // Fallback check for unknown types
+      // For other statement types, we consider them the same if the code matches
       break;
     }
   }
-
+  
+  // If we've made it this far, the functions are considered substantially the same
   if (dump_file) {
     fprintf(dump_file, "Functions are substantially the same\n");
   }
-
   return true;
 }
-
 
 // Print the pruning decision
 void
@@ -324,6 +332,13 @@ pass_kzaw::execute(function *fun)
   // Check if this is a clone function or a default function with clones
   std::string base_name, variant;
   bool is_clone_or_default = is_clone_function(fndecl, base_name, variant);
+
+  if (!is_clone_or_default) {
+    const char *func_name = IDENTIFIER_POINTER(DECL_NAME(fndecl));
+    if (dump_file)
+      fprintf(dump_file, "NOPRUNE: %s\n", func_name);
+    return 0;
+  }
   
   if (is_clone_or_default) {
     // Collect statements in this function
@@ -340,7 +355,15 @@ pass_kzaw::execute(function *fun)
     }
     
     // Add to the appropriate clone group
-    clone_groups[base_name].push_back(info);
+    auto &group = clone_groups[base_name];
+    group.push_back(info);
+
+    if (info.variant == ".default" && group.size() == 1) {
+      if (dump_file)
+        fprintf(dump_file, "NOPRUNE: %s%s\n", 
+                base_name.c_str(), info.variant.c_str());
+      return 0;
+    }
     
     // Check if we've seen enough clones of this function to make a decision
     if (clone_groups[base_name].size() >= 2) {
